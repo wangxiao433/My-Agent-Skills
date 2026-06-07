@@ -29,4 +29,5 @@ Run the tests with:
 python -m unittest discover -s daily-project-context/tests
 ```
 
-The original single-file draft has been replaced by the structured skill package.
+The structured skill package has been added alongside the original single-file
+draft so the draft can be reviewed before it is removed.
