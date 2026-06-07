@@ -1,72 +1,85 @@
 ---
 name: daily-project-context
-description: Collect GitHub activity and local project logs for a structured daily or weekly engineering review.
+description: Collect GitHub activity and local project logs for precise daily or weekly engineering reviews. Use when Codex should build a review packet from commits, issues, pull requests, comments, releases, simulation/training/build logs, JSON/YAML config, Markdown/JSON output, or saved report files.
 ---
 
 # Daily Project Context
 
-Use this skill when the user wants a daily or weekly review of their engineering
-work, especially when the review should combine GitHub activity with local
-simulation, training, build, or debugging logs.
-
-## Goal
-
-Create a structured review packet that helps the assistant answer:
-
-- What did the user do during the selected date range?
-- Which repositories, issues, pull requests, or commits changed?
-- Which local logs contain errors, warnings, convergence problems, NaN/OOM
-  failures, timeouts, or other blockers?
-- What is missing, risky, or worth doing next?
-
-## Inputs
-
-Ask for or infer these values before running the helper script:
-
-- GitHub username.
-- Local workspace path to scan.
-- Date or date range.
-- Timezone. Default to `UTC+8` when the user does not specify one.
-- Optional GitHub token when private activity is required.
-- Optional log extensions, keywords, excluded folders, and scan limits.
+Use this skill to prepare evidence for an engineering daily or weekly review.
+The helper script collects GitHub activity and local log excerpts, then renders a
+Markdown or JSON packet. Treat the packet as evidence, not as complete truth.
 
 ## Workflow
 
-1. Run `scripts/gather_daily_project_context.py` with the user's GitHub username
-   and workspace path.
-2. Read the generated report packet.
-3. Produce a human review with these sections:
-   - Review date.
-   - What was done.
-   - Evidence from GitHub and local logs.
-   - Problems, blockers, and likely causes.
-   - Missing context.
-   - Next actions.
-4. If the data is thin or GitHub reports no public activity, say so directly and
-   ask for the missing source instead of inventing progress.
+1. Identify the GitHub username, local workspace path, date window, and timezone.
+2. Ask for `repositories` and a GitHub token only when private repositories or
+   richer PR/Issue data are required.
+3. Run `scripts/gather_daily_project_context.py`.
+4. Read the packet and produce the final review with:
+   - review range
+   - completed work with evidence
+   - local errors, warnings, or blockers
+   - missing context
+   - next concrete actions
+5. State when evidence is incomplete instead of inferring unseen work.
 
-## Safety
+## Common Commands
 
-- Only scan directories explicitly provided by the user.
-- Do not scan home directories, entire drives, or cloud-sync roots unless the user
-  explicitly asks for that path.
-- Respect the script's scan limits.
-- Treat log contents as sensitive. Redact secrets, tokens, passwords, and API keys
-  before including excerpts in the final answer.
-- Prefer relative file paths in summaries when possible.
-- Do not upload local logs to third-party services unless the user explicitly asks.
-
-## Helper
-
-Example command:
+Daily Markdown:
 
 ```bash
 python daily-project-context/scripts/gather_daily_project_context.py \
   --github-username wangxiao433 \
   --workspace-path C:\Projects\Workspace \
-  --date 2026-06-07 \
-  --timezone-offset 8
+  --date 2026-06-07
 ```
 
-The helper returns a Markdown packet. The packet is evidence for the assistant;
-it is not the final user-facing review by itself.
+Weekly JSON with richer repository collection:
+
+```bash
+python daily-project-context/scripts/gather_daily_project_context.py \
+  --github-username wangxiao433 \
+  --workspace-path C:\Projects\Workspace \
+  --period weekly \
+  --date 2026-06-07 \
+  --repo wangxiao433/My-Agent-Skills \
+  --github-token %GITHUB_TOKEN% \
+  --format json
+```
+
+Config file plus saved Markdown:
+
+```bash
+python daily-project-context/scripts/gather_daily_project_context.py \
+  --config daily-project-context/examples/config.example.yaml \
+  --output outputs/daily-review.md
+```
+
+## Evidence Rules
+
+- Use `--since` and `--until` for exact inclusive date ranges.
+- Use `--period weekly` for the trailing 7-day window ending at `--date`.
+- Use `--repo owner/name` when private repositories or more complete repo data
+  matter; public events alone can miss private activity.
+- Use `--format json` when another tool or agent will consume the result.
+- Use `--output path` when the report should be saved.
+- Keep GitHub tokens out of final answers and logs.
+
+## Safety
+
+- Only scan directories explicitly provided by the user.
+- Do not scan home directories, entire drives, or cloud-sync roots unless the user
+  explicitly asks for that exact path.
+- Respect scan limits: maximum files, maximum file bytes, and maximum matched
+  lines per file.
+- Treat logs as sensitive. The helper redacts common token/password patterns, but
+  still inspect excerpts before sharing them externally.
+- Prefer relative file paths in summaries.
+- Do not upload local logs to third-party services unless the user explicitly asks.
+
+## Files
+
+- `scripts/gather_daily_project_context.py`: collector, renderer, CLI.
+- `examples/config.example.yaml`: editable config template.
+- `examples/sample_report.md`: representative Markdown output.
+- `tests/test_gather_daily_project_context.py`: regression tests.
