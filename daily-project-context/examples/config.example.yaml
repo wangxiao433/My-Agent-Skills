@@ -1,0 +1,30 @@
+github_username: wangxiao433
+workspace_path: C:\Projects\Workspace
+period: weekly
+date: 2026-06-07
+timezone_offset: 8
+
+repositories:
+  - wangxiao433/My-Agent-Skills
+
+extensions: [.log, .txt, .out, .err]
+keywords:
+  - error
+  - warning
+  - failed
+  - timeout
+  - nan
+  - oom
+  - cuda out of memory
+  - residual
+  - loss exploded
+  - divergence
+  - converge
+
+excluded_dirs: [.git, node_modules, .venv, build, dist, __pycache__]
+max_files: 40
+max_file_bytes: 1000000
+max_lines_per_file: 50
+max_github_items: 100
+format: markdown
+include_public_events: true
