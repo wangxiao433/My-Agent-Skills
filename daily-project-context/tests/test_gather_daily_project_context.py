@@ -75,6 +75,51 @@ class GatherDailyProjectContextTests(unittest.TestCase):
         self.assertIn("token=[REDACTED]", rendered)
         self.assertNotIn("abc123", rendered)
         self.assertIn("nan", json.dumps(report, ensure_ascii=False).lower())
+        self.assertIn("中文复盘草稿", rendered)
+        self.assertNotIn("\u6d93", rendered)
+
+    def test_engineering_log_parsers_detect_ansys_zemax_and_mujoco(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            ansys_log = workspace / "ansys_solver.out"
+            zemax_log = workspace / "opticstudio_trace.log"
+            mujoco_log = workspace / "mujoco_run.err"
+            ansys_log.write_text(
+                "ANSYS Mechanical Solver\nFATAL ERROR: convergence not achieved due to negative volume\n",
+                encoding="utf-8",
+            )
+            zemax_log.write_text(
+                "Zemax OpticStudio\nRay trace error: no intersection at surface 4\n",
+                encoding="utf-8",
+            )
+            mujoco_log.write_text(
+                "MuJoCo warning\nNan detected in qpos and qvel; constraint solver unstable\n",
+                encoding="utf-8",
+            )
+            for path in (ansys_log, zemax_log, mujoco_log):
+                set_local_mtime(path, 2026, 6, 7)
+
+            config = module.ScanConfig(
+                github_username="wangxiao433",
+                workspace_path=workspace,
+                start_date=date(2026, 6, 7),
+                end_date=date(2026, 6, 7),
+                max_lines_per_file=10,
+            )
+            report = module.build_report(config, events=[])
+
+        logs_by_path = {record["path"]: record for record in report["local_logs"]}
+        self.assertIn("Ansys", logs_by_path["ansys_solver.out"]["detected_tools"])
+        self.assertIn("Zemax/OpticStudio", logs_by_path["opticstudio_trace.log"]["detected_tools"])
+        self.assertIn("MuJoCo", logs_by_path["mujoco_run.err"]["detected_tools"])
+        self.assertEqual(logs_by_path["ansys_solver.out"]["highest_severity"], "critical")
+        self.assertEqual(logs_by_path["opticstudio_trace.log"]["highest_severity"], "critical")
+        self.assertEqual(logs_by_path["mujoco_run.err"]["highest_severity"], "critical")
+        rendered = module.render_markdown(report)
+        self.assertIn("detected_tools", json.dumps(report, ensure_ascii=False))
+        self.assertIn("Ansys", rendered)
+        self.assertIn("Zemax/OpticStudio", rendered)
+        self.assertIn("MuJoCo", rendered)
 
     def test_json_output_is_structured(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -109,6 +154,11 @@ class GatherDailyProjectContextTests(unittest.TestCase):
                         "repositories:",
                         "  - wangxiao433/My-Agent-Skills",
                         "keywords: [error, residual]",
+                        "log_tools: [ansys, mujoco]",
+                        "include_ci: false",
+                        "include_pr_details: false",
+                        f"cache_dir: {Path(temp_dir) / 'cache'}",
+                        "cache_ttl_seconds: 3600",
                         "max_files: 5",
                     ]
                 ),
@@ -123,6 +173,10 @@ class GatherDailyProjectContextTests(unittest.TestCase):
         self.assertEqual(config.end_date, date(2026, 6, 7))
         self.assertEqual(config.repositories, ("wangxiao433/My-Agent-Skills",))
         self.assertIn("residual", config.keywords)
+        self.assertEqual(config.log_tools, ("ansys", "mujoco"))
+        self.assertFalse(config.include_ci)
+        self.assertFalse(config.include_pr_details)
+        self.assertEqual(config.cache_ttl_seconds, 3600)
 
     def test_main_writes_output_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:

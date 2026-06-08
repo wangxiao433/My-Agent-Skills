@@ -1,0 +1,223 @@
+"""Collect GitHub activity and local log evidence for engineering reviews."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+
+DEFAULT_EXTENSIONS = (
+    ".log",
+    ".txt",
+    ".out",
+    ".err",
+    ".lis",
+    ".lst",
+    ".msg",
+    ".sta",
+    ".mon",
+    ".jou",
+    ".zpl",
+    ".mjcf",
+    ".xml",
+)
+DEFAULT_KEYWORDS = (
+    "error",
+    "warning",
+    "failed",
+    "failure",
+    "fatal",
+    "exception",
+    "traceback",
+    "assertion",
+    "abort",
+    "timeout",
+    "killed",
+    "memoryerror",
+    "oom",
+    "out of memory",
+    "cuda out of memory",
+    "nan",
+    "inf",
+    "infinity",
+    "nonfinite",
+    "overflow",
+    "underflow",
+    "divergence",
+    "diverged",
+    "converge",
+    "residual",
+    "loss exploded",
+    "singular",
+    "invalid",
+    "segfault",
+    "segmentation fault",
+    "instability",
+    "unstable",
+    "cublas",
+    "cudnn",
+    "solver",
+    "constraint",
+    "floating point",
+    "license checkout",
+    "mesh failed",
+    "negative volume",
+    "ray trace error",
+    "total internal reflection",
+    "no intersection",
+    "qpos",
+    "qvel",
+    "qacc",
+)
+DEFAULT_EXCLUDED_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "venv",
+    "env",
+    "node_modules",
+    "build",
+    "dist",
+    "__pycache__",
+}
+SECRET_PATTERNS = (
+    re.compile(r"\b(ghp_[A-Za-z0-9_]{20,})\b"),
+    re.compile(r"\b(github_pat_[A-Za-z0-9_]+)\b"),
+    re.compile(r"\b(sk-[A-Za-z0-9]{20,})\b"),
+    re.compile(r"\b(xox[baprs]-[A-Za-z0-9-]{20,})\b"),
+    re.compile(r"(?i)\b(api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]\s*([^\s,;]+)"),
+)
+SEVERITY_SCORES = {"info": 1, "low": 2, "medium": 3, "high": 4, "critical": 5}
+GENERIC_SEVERITY_RULES = (
+    ("critical", ("fatal", "segmentation fault", "segfault", "out of memory", "cuda out of memory", "oom", "nan", "divergence", "diverged")),
+    ("high", ("error", "exception", "traceback", "failed", "failure", "abort", "killed", "instability", "unstable", "floating point")),
+    ("medium", ("warning", "timeout", "invalid", "overflow", "underflow", "residual", "converge", "constraint")),
+    ("low", ("note", "info")),
+)
+TOOL_PROFILES = {
+    "ansys": {
+        "display": "Ansys",
+        "indicators": ("ansys", "fluent", "cfx", "mechanical", "apdl", "mapdl", "workbench", "solver.out", "solve.out", "transient structural", "static structural"),
+        "rules": (
+            (r"\bfatal\s+error\b", "critical", "fatal_error"),
+            (r"\berror\b", "high", "solver_error"),
+            (r"\bwarning\b", "medium", "warning"),
+            (r"license\s+(checkout|manager|server).*(failed|error|not|denied|unavailable)", "high", "license"),
+            (r"out\s+of\s+memory|memory\s+allocation", "critical", "memory"),
+            (r"floating\s+point\s+(exception|error)|divide\s+by\s+zero", "critical", "numerics"),
+            (r"diverg(e|ence|ed)|solution\s+is\s+unconverged|convergence\s+not\s+achieved", "critical", "convergence"),
+            (r"maximum\s+number\s+of\s+iterations|residual", "medium", "convergence"),
+            (r"negative\s+volume|reversed\s+element|element\s+shape|mesh\s+failed|poor\s+quality", "high", "mesh"),
+            (r"pivot|singular|rigid\s+body\s+motion|contact\s+status", "high", "solver_stability"),
+        ),
+    },
+    "zemax": {
+        "display": "Zemax/OpticStudio",
+        "indicators": ("zemax", "opticstudio", "opticsbuilder", "zpl", "ray trace", "non-sequential", "sequential", "merit function", "glass catalog"),
+        "rules": (
+            (r"ray\s+trace\s+error|cannot\s+trace|unable\s+to\s+trace", "critical", "ray_trace"),
+            (r"total\s+internal\s+reflection|tir\b", "high", "ray_trace"),
+            (r"no\s+intersection|missed\s+surface|object\s+missed|ray\s+missed", "high", "geometry"),
+            (r"vignetting|vignetted|aperture\s+stop|surface\s+aperture", "medium", "aperture"),
+            (r"operand\s+invalid|merit\s+function.*(error|failed)|optimization\s+failed", "high", "optimization"),
+            (r"tolerance.*(fail|failed|error)", "high", "tolerance"),
+            (r"glass.*(not\s+found|missing)|catalog.*(not\s+found|missing|unable)", "high", "catalog"),
+            (r"negative\s+thickness|invalid\s+surface|chief\s+ray|pupil", "medium", "model"),
+        ),
+    },
+    "mujoco": {
+        "display": "MuJoCo",
+        "indicators": ("mujoco", "mjmodel", "mjdata", "mjwarn", "qpos", "qvel", "qacc", "mjcf", "constraint solver"),
+        "rules": (
+            (r"\bnan\b|non-?finite|inf(inity)?", "critical", "numerics"),
+            (r"qpos|qvel|qacc|badqacc|ctrl", "high", "state"),
+            (r"diverg(e|ence|ed)|unstable|instability", "critical", "stability"),
+            (r"constraint\s+(violation|solver)|contact\s+solver", "high", "constraint"),
+            (r"timestep|time\s+step|dt\b", "medium", "integration"),
+            (r"xml\s+error|mjcf|schema|compiler", "high", "model_compile"),
+            (r"inertia|mass|joint|actuator|keyframe", "medium", "model"),
+            (r"warning|mjwarn", "medium", "warning"),
+        ),
+    },
+}
+
+
+@dataclass(frozen=True)
+class TimeWindow:
+    start: datetime
+    end: datetime
+    label: str
+
+
+@dataclass(frozen=True)
+class ScanConfig:
+    github_username: str
+    workspace_path: Path
+    start_date: date
+    end_date: date
+    timezone_offset_hours: int = 8
+    github_token: str | None = None
+    repositories: tuple[str, ...] = ()
+    include_public_events: bool = True
+    include_pr_details: bool = True
+    include_ci: bool = True
+    extensions: tuple[str, ...] = DEFAULT_EXTENSIONS
+    keywords: tuple[str, ...] = DEFAULT_KEYWORDS
+    log_tools: tuple[str, ...] = ()
+    excluded_dirs: set[str] = field(default_factory=lambda: set(DEFAULT_EXCLUDED_DIRS))
+    max_files: int = 40
+    max_file_bytes: int = 1_000_000
+    max_lines_per_file: int = 50
+    max_github_items: int = 100
+    cache_dir: Path | None = None
+    cache_ttl_seconds: int = 0
+    output_format: str = "markdown"
+    include_review: bool = True
+    review_language: str = "zh"
+
+
+def parse_date(value: str | date) -> date:
+    return value if isinstance(value, date) else date.fromisoformat(value)
+
+
+def normalize_extension(value: str) -> str:
+    value = value.strip()
+    return value if value.startswith(".") else f".{value}"
+
+
+def local_window(start_date: date, end_date: date, timezone_offset_hours: int) -> TimeWindow:
+    if end_date < start_date:
+        raise ValueError("--until must be the same as or later than --since")
+    tz = timezone(timedelta(hours=timezone_offset_hours))
+    start = datetime.combine(start_date, time.min, tzinfo=tz)
+    end = datetime.combine(end_date + timedelta(days=1), time.min, tzinfo=tz)
+    label = start_date.isoformat() if start_date == end_date else f"{start_date.isoformat()} to {end_date.isoformat()}"
+    return TimeWindow(start=start, end=end, label=label)
+
+
+def parse_github_time(value: str) -> datetime:
+    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def iso_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def event_time_in_window(value: str | None, window: TimeWindow) -> bool:
+    if not value:
+        return False
+    return window.start <= parse_github_time(value).astimezone(window.sta

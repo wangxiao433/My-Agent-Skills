@@ -1,6 +1,6 @@
 ---
 name: daily-project-context
-description: Collect GitHub activity and local project logs for precise daily or weekly engineering reviews. Use when Codex should build a review packet from commits, issues, pull requests, comments, releases, simulation/training/build logs, JSON/YAML config, Markdown/JSON output, or saved report files.
+description: Collect GitHub activity and local project logs for precise daily or weekly engineering reviews. Use when Codex should build a review packet from commits, issues, pull requests, comments, reviews, CI checks, Ansys/Zemax/MuJoCo simulation logs, training/build logs, JSON/YAML config, Markdown/JSON output, or saved report files.
 ---
 
 # Daily Project Context
@@ -47,6 +47,17 @@ python daily-project-context/scripts/gather_daily_project_context.py \
   --format json
 ```
 
+Force a specific engineering log parser:
+
+```bash
+python daily-project-context/scripts/gather_daily_project_context.py \
+  --github-username wangxiao433 \
+  --workspace-path C:\Projects\Workspace \
+  --date 2026-06-07 \
+  --log-tool ansys \
+  --log-tool mujoco
+```
+
 Config file plus saved Markdown:
 
 ```bash
@@ -61,6 +72,11 @@ python daily-project-context/scripts/gather_daily_project_context.py \
 - Use `--period weekly` for the trailing 7-day window ending at `--date`.
 - Use `--repo owner/name` when private repositories or more complete repo data
   matter; public events alone can miss private activity.
+- Use `--no-ci` or `--no-pr-details` to reduce GitHub API calls.
+- Use `--cache-dir` and `--cache-ttl-seconds` to reduce GitHub API rate-limit
+  pressure. Cache is disabled by default.
+- Use `--log-tool ansys|zemax|mujoco` only when auto-detection misses a known
+  log type.
 - Use `--format json` when another tool or agent will consume the result.
 - Use `--output path` when the report should be saved.
 - Keep GitHub tokens out of final answers and logs.
@@ -79,7 +95,9 @@ python daily-project-context/scripts/gather_daily_project_context.py \
 
 ## Files
 
-- `scripts/gather_daily_project_context.py`: collector, renderer, CLI.
+- `scripts/gather_daily_project_context.py`: stable collector, renderer, and CLI entry point.
+- `scripts/gather_daily_project_context_part*.pyfrag`: split implementation loaded by the entry point.
+- `references/log-parsers.md`: Ansys, Zemax/OpticStudio, and MuJoCo parser rules.
 - `examples/config.example.yaml`: editable config template.
 - `examples/sample_report.md`: representative Markdown output.
 - `tests/test_gather_daily_project_context.py`: regression tests.

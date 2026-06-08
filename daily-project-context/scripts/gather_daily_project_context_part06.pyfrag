@@ -1,0 +1,88 @@
+ else parse_date(date_arg) if date_arg else today
+    if since_arg:
+        start_date = parse_date(since_arg)
+    elif days:
+        start_date = end_date - timedelta(days=int(days) - 1)
+    elif period == "weekly":
+        start_date = end_date - timedelta(days=6)
+    else:
+        start_date = end_date
+    log_tools = tuple(tool.lower() for tool in (split_csv(args.log_tool) or ensure_list(config_value(config_data, "log_tools", []))) if tool.lower() in TOOL_PROFILES)
+    cache_dir_value = args.cache_dir or config_value(config_data, "cache_dir")
+    return ScanConfig(
+        github_username=str(github_username),
+        workspace_path=Path(str(workspace_path)),
+        start_date=start_date,
+        end_date=end_date,
+        timezone_offset_hours=tz_offset,
+        github_token=args.github_token or config_value(config_data, "github_token"),
+        repositories=tuple(split_csv(args.repo) or ensure_list(config_value(config_data, "repositories", []))),
+        include_public_events=(not args.no_public_events) and as_bool(config_value(config_data, "include_public_events", True)),
+        include_pr_details=(not args.no_pr_details) and as_bool(config_value(config_data, "include_pr_details", True)),
+        include_ci=(not args.no_ci) and as_bool(config_value(config_data, "include_ci", True)),
+        extensions=tuple(normalize_extension(item) for item in (split_csv(args.extension) or ensure_list(config_value(config_data, "extensions", DEFAULT_EXTENSIONS)))),
+        keywords=tuple(split_csv(args.keyword) or ensure_list(config_value(config_data, "keywords", DEFAULT_KEYWORDS))),
+        log_tools=log_tools,
+        excluded_dirs=set(split_csv(args.exclude_dir) or ensure_list(config_value(config_data, "excluded_dirs", DEFAULT_EXCLUDED_DIRS))),
+        max_files=int(args.max_files if args.max_files is not None else config_value(config_data, "max_files", 40)),
+        max_file_bytes=int(args.max_file_bytes if args.max_file_bytes is not None else config_value(config_data, "max_file_bytes", 1_000_000)),
+        max_lines_per_file=int(args.max_lines_per_file if args.max_lines_per_file is not None else config_value(config_data, "max_lines_per_file", 50)),
+        max_github_items=int(args.max_github_items if args.max_github_items is not None else config_value(config_data, "max_github_items", 100)),
+        cache_dir=Path(str(cache_dir_value)) if cache_dir_value else None,
+        cache_ttl_seconds=int(args.cache_ttl_seconds if args.cache_ttl_seconds is not None else config_value(config_data, "cache_ttl_seconds", 0)),
+        output_format=args.format or config_value(config_data, "format", "markdown"),
+        include_review=not args.no_review,
+        review_language=str(config_value(config_data, "review_language", "zh")),
+    )
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config")
+    parser.add_argument("--github-username")
+    parser.add_argument("--workspace-path")
+    parser.add_argument("--date")
+    parser.add_argument("--since")
+    parser.add_argument("--until")
+    parser.add_argument("--period", choices=("daily", "weekly"))
+    parser.add_argument("--days", type=int)
+    parser.add_argument("--timezone-offset", type=int)
+    parser.add_argument("--github-token")
+    parser.add_argument("--repo", action="append")
+    parser.add_argument("--extension", action="append")
+    parser.add_argument("--keyword", action="append")
+    parser.add_argument("--log-tool", action="append")
+    parser.add_argument("--exclude-dir", action="append")
+    parser.add_argument("--max-files", type=int)
+    parser.add_argument("--max-file-bytes", type=int)
+    parser.add_argument("--max-lines-per-file", type=int)
+    parser.add_argument("--max-github-items", type=int)
+    parser.add_argument("--cache-dir")
+    parser.add_argument("--cache-ttl-seconds", type=int)
+    parser.add_argument("--format", choices=("markdown", "json"))
+    parser.add_argument("--output")
+    parser.add_argument("--no-review", action="store_true")
+    parser.add_argument("--no-public-events", action="store_true")
+    parser.add_argument("--no-pr-details", action="store_true")
+    parser.add_argument("--no-ci", action="store_true")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        args = parse_args(argv)
+        config = build_config(args)
+        rendered = render_report(build_report(config), config.output_format)
+        if args.output:
+            output_path = Path(args.output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(rendered, encoding="utf-8")
+        print(rendered)
+        return 0
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

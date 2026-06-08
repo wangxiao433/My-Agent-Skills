@@ -1,0 +1,148 @@
+:
+        text += f" ({record['timestamp']})"
+    if record.get("url"):
+        text += f" - {record['url']}"
+    return text
+
+
+def render_markdown(report: dict[str, Any]) -> str:
+    scope = report["scope"]
+    lines = [f"# Project Context Review: {scope['window_label']}", "", "## Scope", f"- GitHub user: {scope['github_username']}", f"- Workspace: {scope['workspace_path']}", f"- Time window: {scope['start']} to {scope['end_exclusive']} (end exclusive)", f"- Repositories: {', '.join(scope['repositories']) if scope['repositories'] else '(not configured)'}", "", "## GitHub Activity"]
+    github_records = report.get("github_activity", [])
+    lines.extend(github_record_to_line(record) for record in github_records)
+    if not github_records:
+        lines.append("- No GitHub activity was captured in the selected window.")
+    lines.extend(["", "## Local Logs"])
+    local_logs = report.get("local_logs", [])
+    if not local_logs:
+        lines.append("- No updated log files were found in the selected window.")
+    for record in local_logs:
+        lines.append(f"- {record['path']} ({record.get('modified_at')}, {record.get('size_bytes')} bytes, tools: {', '.join(record.get('detected_tools', [])) or 'generic'}, highest: {record.get('highest_severity', 'info')})")
+        if record.get("error"):
+            lines.append(f"  - {record['error']}")
+        matches = record.get("matches", [])
+        if not matches:
+            lines.append("  - File changed, but no configured keyword was found.")
+        for match in matches:
+            parser_text = ", ".join(f"{hit.get('tool')}:{hit.get('category')}" for hit in match.get("parser_hits", []))
+            parser_suffix = f" parsers={parser_text}" if parser_text else ""
+            lines.append(f"  - Line {match.get('line')} [{match.get('severity', 'info')} | {', '.join(match.get('keywords', []))}]{parser_suffix}: {match.get('text')}")
+    if report.get("errors"):
+        lines.extend(["", "## Collection Errors"])
+        lines.extend(f"- {error}" for error in report["errors"])
+    review = report.get("review")
+    if review:
+        lines.extend(["", "## \u4e2d\u6587\u590d\u76d8\u8349\u7a3f", f"- \u8bc1\u636e\u8fb9\u754c: {review['evidence_note']}", f"- \u6355\u83b7\u5230\u7684 GitHub \u8bb0\u5f55\u6570: {review['captured_progress_count']}", f"- \u547d\u4e2d\u5173\u952e\u8bcd\u7684\u65e5\u5fd7\u6587\u4ef6\u6570: {review['matched_log_file_count']}"])
+        if review.get("detected_tool_counts"):
+            lines.append("- \u68c0\u6d4b\u5230\u7684\u5de5\u7a0b\u5de5\u5177: " + ", ".join(f"{tool} x{count}" for tool, count in review["detected_tool_counts"]))
+        if review.get("severity_summary"):
+            lines.append("- \u4e25\u91cd\u7a0b\u5ea6\u5206\u5e03: " + ", ".join(f"{severity} x{count}" for severity, count in review["severity_summary"].items()))
+        if review.get("top_risk_keywords"):
+            lines.append("- \u9ad8\u98ce\u9669\u5173\u952e\u8bcd: " + ", ".join(f"{keyword} x{count}" for keyword, count in review["top_risk_keywords"]))
+        if review.get("high_risk_files"):
+            lines.append("- \u9ad8\u98ce\u9669\u6587\u4ef6:")
+            lines.extend(f"  - {item['path']} ({item['highest_severity']})" for item in review["high_risk_files"])
+        missing_context = [item for item in review.get("missing_context", []) if item]
+        if missing_context:
+            lines.append("- \u7f3a\u5931\u4e0a\u4e0b\u6587:")
+            lines.extend(f"  - {item}" for item in missing_context)
+        lines.append("- \u4e0b\u4e00\u6b65\u5efa\u8bae:")
+        lines.extend(f"  - {item}" for item in review.get("next_actions", []))
+    lines.extend(["", "## Assistant Review Checklist", "- Summarize completed work with direct evidence.", "- Connect GitHub activity to relevant local errors or warnings.", "- Call out missing context instead of guessing.", "- Propose the next concrete actions."])
+    return "\n".join(lines)
+
+
+def render_report(report: dict[str, Any], output_format: str) -> str:
+    return json.dumps(report, ensure_ascii=False, indent=2) if output_format == "json" else render_markdown(report)
+
+
+def parse_scalar(value: str) -> Any:
+    value = value.strip()
+    if not value:
+        return ""
+    if value.lower() in {"true", "false"}:
+        return value.lower() == "true"
+    if value.startswith("[") and value.endswith("]"):
+        return [item.strip().strip("'\"") for item in value[1:-1].split(",") if item.strip()]
+    try:
+        return int(value)
+    except ValueError:
+        return value.strip("'\"")
+
+
+def load_simple_yaml(text: str) -> dict[str, Any]:
+    data: dict[str, Any] = {}
+    current_key: str | None = None
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].rstrip()
+        if not line:
+            continue
+        stripped = line.strip()
+        if stripped.startswith("- ") and current_key:
+            data.setdefault(current_key, []).append(parse_scalar(stripped[2:]))
+            continue
+        if ":" not in line:
+            raise ValueError(f"Unsupported config line: {raw_line}")
+        key, value = line.split(":", 1)
+        current_key = key.strip().replace("-", "_")
+        parsed = parse_scalar(value)
+        data[current_key] = [] if parsed == "" else parsed
+    return data
+
+
+def load_config(path: Path | None) -> dict[str, Any]:
+    if not path:
+        return {}
+    text = path.read_text(encoding="utf-8")
+    if path.suffix.lower() == ".json":
+        return json.loads(text)
+    if path.suffix.lower() in {".yaml", ".yml"}:
+        try:
+            import yaml  # type: ignore
+
+            return yaml.safe_load(text) or {}
+        except ImportError:
+            return load_simple_yaml(text)
+    raise ValueError("Config file must be .json, .yaml, or .yml")
+
+
+def split_csv(values: Iterable[str] | None) -> list[str]:
+    result: list[str] = []
+    for value in values or []:
+        result.extend(item.strip() for item in value.split(",") if item.strip())
+    return result
+
+
+def ensure_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return split_csv([value])
+    return [str(item) for item in value]
+
+
+def as_bool(value: Any) -> bool:
+    return value if isinstance(value, bool) else str(value).lower() not in {"0", "false", "no", "off"}
+
+
+def config_value(data: dict[str, Any], key: str, default: Any = None) -> Any:
+    return data.get(key, default)
+
+
+def build_config(args: argparse.Namespace) -> ScanConfig:
+    config_data = load_config(Path(args.config)) if args.config else {}
+    tz_offset = args.timezone_offset if args.timezone_offset is not None else int(config_value(config_data, "timezone_offset", 8))
+    tz = timezone(timedelta(hours=tz_offset))
+    github_username = args.github_username or config_value(config_data, "github_username")
+    workspace_path = args.workspace_path or config_value(config_data, "workspace_path")
+    if not github_username:
+        raise ValueError("github_username is required through --github-username or config")
+    if not workspace_path:
+        raise ValueError("workspace_path is required through --workspace-path or config")
+    today = datetime.now(tz).date()
+    date_arg = args.date or config_value(config_data, "date")
+    until_arg = args.until or config_value(config_data, "until")
+    since_arg = args.since or config_value(config_data, "since")
+    period = args.period or config_value(config_data, "period", "daily")
+    days = args.days if args.days is not None else config_value(config_data, "days")
+    end_date = parse_date(until_arg) if until_arg

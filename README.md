@@ -5,7 +5,8 @@ and includes a `SKILL.md` file plus helper scripts, examples, and tests.
 
 ## Skills
 
-- `daily-project-context`: Collects GitHub activity and local engineering logs,
+- `daily-project-context`: Collects GitHub activity, PR/review/CI signals, and
+  local engineering logs including Ansys, Zemax/OpticStudio, and MuJoCo patterns,
   then prepares a precise daily or weekly review packet for an AI assistant.
 
 ## Repository Layout
@@ -15,9 +16,12 @@ daily-project-context/
   SKILL.md
   scripts/
     gather_daily_project_context.py
+    gather_daily_project_context_part*.pyfrag
   examples/
     config.example.yaml
     sample_report.md
+  references/
+    log-parsers.md
   tests/
     test_gather_daily_project_context.py
 ```
@@ -62,4 +66,6 @@ Run the tests with:
 python -m unittest discover -s daily-project-context/tests
 ```
 
-The repository now uses a structured skill package layout.
+The repository now uses a structured skill package layout. The main script is a
+stable entry point; its implementation is split into small `.pyfrag` files so
+connector-based updates stay reliable.

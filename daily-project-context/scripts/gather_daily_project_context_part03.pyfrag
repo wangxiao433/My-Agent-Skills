@@ -1,0 +1,136 @@
+mestamp, url=item.get("html_url"))
+        except Exception as exc:
+            errors.append(f"{kind} failed for {repo}#{pull_number}: {exc}")
+    return records, errors
+
+
+def fetch_repository_records(config: ScanConfig, window: TimeWindow) -> tuple[list[dict[str, Any]], list[str]]:
+    records: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for repo in config.repositories:
+        try:
+            commits = request_json(f"https://api.github.com/repos/{repo}/commits", token=config.github_token, params={"author": config.github_username, "since": iso_utc(window.start), "until": iso_utc(window.end), "per_page": str(min(config.max_github_items, 100))}, cache_dir=config.cache_dir, cache_ttl_seconds=config.cache_ttl_seconds)
+            for commit in commits:
+                data = commit.get("commit", {})
+                sha = commit.get("sha", "")
+                add_record(records, source="github_repo_commits", kind="commit", repo=repo, summary=data.get("message", "").splitlines()[0], timestamp=data.get("author", {}).get("date"), url=commit.get("html_url"))
+                ci_records, ci_errors = fetch_ci_records(config, repo, sha, window)
+                records.extend(ci_records)
+                errors.extend(ci_errors)
+        except Exception as exc:
+            errors.append(f"Repo commits failed for {repo}: {exc}")
+        try:
+            issues = request_json(f"https://api.github.com/repos/{repo}/issues", token=config.github_token, params={"state": "all", "since": iso_utc(window.start), "per_page": str(min(config.max_github_items, 100))}, cache_dir=config.cache_dir, cache_ttl_seconds=config.cache_ttl_seconds)
+            for issue in issues:
+                if not any(event_time_in_window(issue.get(key), window) for key in ("created_at", "updated_at", "closed_at")):
+                    continue
+                add_record(records, source="github_repo_issues", kind="pull_request" if issue.get("pull_request") else "issue", repo=repo, summary=f"{issue.get('state', 'unknown')} - {issue.get('title', '')}", timestamp=issue.get("updated_at") or issue.get("created_at"), url=issue.get("html_url"))
+        except Exception as exc:
+            errors.append(f"Repo issues failed for {repo}: {exc}")
+        try:
+            pulls = request_json(f"https://api.github.com/repos/{repo}/pulls", token=config.github_token, params={"state": "all", "sort": "updated", "direction": "desc", "per_page": str(min(config.max_github_items, 100))}, cache_dir=config.cache_dir, cache_ttl_seconds=config.cache_ttl_seconds)
+            for pull in pulls:
+                if not any(event_time_in_window(pull.get(key), window) for key in ("created_at", "updated_at", "closed_at", "merged_at")):
+                    continue
+                state = "merged" if pull.get("merged_at") else pull.get("state", "unknown")
+                add_record(records, source="github_repo_pulls", kind="pull_request", repo=repo, summary=f"{state} - {pull.get('title', '')}", timestamp=pull.get("updated_at") or pull.get("created_at"), url=pull.get("html_url"))
+                if pull.get("number"):
+                    detail_records, detail_errors = fetch_pull_detail_records(config, repo, int(pull["number"]), window)
+                    records.extend(detail_records)
+                    errors.extend(detail_errors)
+        except Exception as exc:
+            errors.append(f"Repo pulls failed for {repo}: {exc}")
+    return dedupe_records(records), errors
+
+
+def dedupe_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[Any, ...]] = set()
+    unique: list[dict[str, Any]] = []
+    for record in records:
+        key = (record.get("kind"), record.get("repo"), record.get("summary"), record.get("url"))
+        if key not in seen:
+            seen.add(key)
+            unique.append(record)
+    return unique
+
+
+def collect_github_records(config: ScanConfig, window: TimeWindow, events: Iterable[dict[str, Any]] | None = None) -> tuple[list[dict[str, Any]], list[str]]:
+    if events is not None:
+        return [record for event in events if event_time_in_window(event.get("created_at"), window) for record in summarize_public_event(event, window)], []
+    public_records, public_errors = fetch_public_github_records(config, window)
+    repo_records, repo_errors = fetch_repository_records(config, window)
+    return dedupe_records(public_records + repo_records), public_errors + repo_errors
+
+
+def iter_candidate_log_files(config: ScanConfig, window: TimeWindow) -> list[Path]:
+    if not config.workspace_path.exists():
+        return []
+    candidates: list[tuple[float, Path]] = []
+    for root, dirs, files in os.walk(config.workspace_path):
+        root_path = Path(root)
+        dirs[:] = [name for name in dirs if name not in config.excluded_dirs]
+        if any(part in config.excluded_dirs for part in root_path.relative_to(config.workspace_path).parts):
+            continue
+        for file_name in files:
+            file_path = root_path / file_name
+            if file_path.suffix.lower() not in config.extensions:
+                continue
+            try:
+                stat = file_path.stat()
+            except OSError:
+                continue
+            modified = datetime.fromtimestamp(stat.st_mtime, tz=window.start.tzinfo)
+            if stat.st_size <= config.max_file_bytes and window.start <= modified < window.end:
+                candidates.append((stat.st_mtime, file_path))
+    candidates.sort(reverse=True)
+    return [path for _, path in candidates[: config.max_files]]
+
+
+def keyword_matches(text: str, keywords: tuple[str, ...]) -> list[str]:
+    lowered = text.lower()
+    return [keyword for keyword in keywords if keyword.lower() in lowered]
+
+
+def choose_highest_severity(severities: Iterable[str]) -> str:
+    return max(list(severities) or ["info"], key=lambda item: SEVERITY_SCORES.get(item, 0))
+
+
+def generic_severity(line: str, matched_keywords: Iterable[str]) -> str:
+    haystack = f"{line.lower()} {' '.join(keyword.lower() for keyword in matched_keywords)}"
+    for severity, needles in GENERIC_SEVERITY_RULES:
+        if any(needle in haystack for needle in needles):
+            return severity
+    return "low" if matched_keywords else "info"
+
+
+def detect_log_tools(file_path: Path, lines: list[str], requested_tools: tuple[str, ...]) -> list[str]:
+    if requested_tools:
+        return [tool for tool in requested_tools if tool in TOOL_PROFILES]
+    sample = "\n".join(lines[:120]).lower()
+    path_text = str(file_path).lower()
+    return [tool for tool, profile in TOOL_PROFILES.items() if any(indicator in path_text or indicator in sample for indicator in profile["indicators"])]
+
+
+def parser_rule_matches(line: str, tools: list[str]) -> list[dict[str, str]]:
+    hits: list[dict[str, str]] = []
+    for tool in tools:
+        profile = TOOL_PROFILES[tool]
+        for pattern, severity, category in profile["rules"]:
+            if re.search(pattern, line, flags=re.IGNORECASE):
+                hits.append({"tool": profile["display"], "tool_key": tool, "category": category, "severity": severity, "pattern": pattern})
+    return hits
+
+
+def severity_counts(matches: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for match in matches:
+        severity = match.get("severity", "info")
+        counts[severity] = counts.get(severity, 0) + 1
+    return counts
+
+
+def collect_log_matches(file_path: Path, config: ScanConfig) -> dict[str, Any]:
+    try:
+        lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError as exc:
+        r

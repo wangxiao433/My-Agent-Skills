@@ -1,0 +1,78 @@
+eturn {"error": f"Read failed: {exc}", "matches": []}
+    detected_tools = detect_log_tools(file_path, lines, config.log_tools)
+    matches = []
+    for line_number, line in enumerate(lines, start=1):
+        matched_keywords = keyword_matches(line, config.keywords)
+        parser_hits = parser_rule_matches(line, detected_tools)
+        if not matched_keywords and not parser_hits:
+            continue
+        severity = choose_highest_severity([hit["severity"] for hit in parser_hits] + ([generic_severity(line, matched_keywords)] if matched_keywords else []))
+        matches.append({"line": line_number, "keywords": matched_keywords, "tools": [TOOL_PROFILES[tool]["display"] for tool in detected_tools], "parser_hits": parser_hits, "severity": severity, "severity_score": SEVERITY_SCORES.get(severity, 0), "text": redact_secret(line.strip())})
+        if len(matches) >= config.max_lines_per_file:
+            break
+    return {"matches": matches, "line_count": len(lines), "detected_tools": [TOOL_PROFILES[tool]["display"] for tool in detected_tools], "highest_severity": choose_highest_severity(match.get("severity", "info") for match in matches), "severity_counts": severity_counts(matches)}
+
+
+def collect_local_logs(config: ScanConfig, window: TimeWindow) -> tuple[list[dict[str, Any]], list[str]]:
+    if not config.workspace_path.exists():
+        return [], [f"Workspace not found: {config.workspace_path}"]
+    records: list[dict[str, Any]] = []
+    for file_path in iter_candidate_log_files(config, window):
+        relative = file_path.relative_to(config.workspace_path)
+        stat = file_path.stat()
+        result = collect_log_matches(file_path, config)
+        records.append({"path": str(relative), "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=window.start.tzinfo).isoformat(), "size_bytes": stat.st_size, "line_count": result.get("line_count"), "detected_tools": result.get("detected_tools", []), "highest_severity": result.get("highest_severity", "info"), "severity_counts": result.get("severity_counts", {}), "matches": result.get("matches", []), "error": result.get("error")})
+    return records, []
+
+
+def build_review(scope: dict[str, Any], github_records: list[dict[str, Any]], log_records: list[dict[str, Any]], errors: list[str]) -> dict[str, Any]:
+    matched_logs = [record for record in log_records if record.get("matches")]
+    risk_keywords: dict[str, int] = {}
+    tool_counts: dict[str, int] = {}
+    severity_summary: dict[str, int] = {}
+    high_risk_files: list[dict[str, str]] = []
+    for record in matched_logs:
+        for tool in record.get("detected_tools", []):
+            tool_counts[tool] = tool_counts.get(tool, 0) + 1
+        for severity, count in record.get("severity_counts", {}).items():
+            severity_summary[severity] = severity_summary.get(severity, 0) + count
+        if SEVERITY_SCORES.get(record.get("highest_severity", "info"), 0) >= SEVERITY_SCORES["high"]:
+            high_risk_files.append({"path": record.get("path", ""), "highest_severity": record.get("highest_severity", "info")})
+        for match in record.get("matches", []):
+            for keyword in match.get("keywords", []):
+                risk_keywords[keyword] = risk_keywords.get(keyword, 0) + 1
+    next_actions = []
+    if high_risk_files:
+        next_actions.append("\u4f18\u5148\u6253\u5f00 high/critical \u65e5\u5fd7\u6587\u4ef6\uff0c\u786e\u8ba4\u662f\u5426\u5b58\u5728\u6c42\u89e3\u5931\u8d25\u3001\u53d1\u6563\u3001NaN\u3001OOM\u3001\u5149\u7ebf\u8ffd\u8ff9\u5931\u8d25\u6216\u6a21\u578b\u7f16\u8bd1\u9519\u8bef\u3002")
+    elif matched_logs:
+        next_actions.append("\u9010\u4e2a\u6253\u5f00 Local Logs \u4e2d\u6709\u5339\u914d\u884c\u7684\u6587\u4ef6\uff0c\u5148\u786e\u8ba4 warning/residual/convergence \u7b49\u4e2d\u7b49\u98ce\u9669\u9879\u662f\u5426\u5f71\u54cd\u7ed3\u679c\u53ef\u4fe1\u5ea6\u3002")
+    if tool_counts:
+        next_actions.append("\u6309 detected_tools \u5206\u7ec4\u590d\u76d8\uff1aAnsys \u770b\u7f51\u683c/\u6536\u655b/\u8bb8\u53ef\u8bc1\uff0cZemax \u770b\u5149\u7ebf\u8ffd\u8ff9/\u5b54\u5f84/\u73bb\u7483\u5e93\uff0cMuJoCo \u770b\u72b6\u6001\u91cf/\u7ea6\u675f/\u79ef\u5206\u7a33\u5b9a\u6027\u3002")
+    if not github_records:
+        next_actions.append("\u8865\u5145 GitHub token \u6216 repositories \u914d\u7f6e\uff0c\u4ee5\u786e\u8ba4\u662f\u5426\u5b58\u5728\u79c1\u6709\u4ed3\u5e93\u6d3b\u52a8\u3002")
+    if errors:
+        next_actions.append("\u5148\u5904\u7406\u91c7\u96c6\u9519\u8bef\uff0c\u907f\u514d\u590d\u76d8\u57fa\u4e8e\u4e0d\u5b8c\u6574\u8bc1\u636e\u3002")
+    if not next_actions:
+        next_actions.append("\u57fa\u4e8e\u5df2\u91c7\u96c6\u8bc1\u636e\u6574\u7406\u5b8c\u6210\u9879\uff0c\u5e76\u8865\u5145\u4eba\u5de5\u5224\u65ad\u7684\u4e0b\u4e00\u6b65\u8ba1\u5212\u3002")
+    missing_context = [
+        "\u6ca1\u6709\u914d\u7f6e repositories \u65f6\uff0c\u79c1\u6709\u4ed3\u5e93\u548c\u66f4\u5b8c\u6574\u7684 PR/Issue/CI \u6570\u636e\u53ef\u80fd\u7f3a\u5931\u3002" if not scope.get("repositories") else "",
+        "GitHub API \u9519\u8bef\u4f1a\u5bfc\u81f4\u7ebf\u4e0a\u6d3b\u52a8\u8bc1\u636e\u4e0d\u5b8c\u6574\u3002" if errors else "",
+        "\u6ca1\u6709\u5339\u914d\u65e5\u5fd7\u5173\u952e\u8bcd\u4e0d\u7b49\u4e8e\u6ca1\u6709\u95ee\u9898\uff0c\u53ea\u8868\u793a\u5f53\u524d\u89c4\u5219\u672a\u6355\u83b7\u5230\u8bc1\u636e\u3002" if not matched_logs else "",
+    ]
+    return {"language": "zh", "evidence_note": "\u4ee5\u4e0b\u590d\u76d8\u8349\u7a3f\u53ea\u57fa\u4e8e\u91c7\u96c6\u5230\u7684 GitHub \u8bb0\u5f55\u548c\u672c\u5730\u65e5\u5fd7\u8bc1\u636e\uff0c\u4e0d\u63a8\u65ad\u672a\u51fa\u73b0\u7684\u4e8b\u5b9e\u3002", "captured_progress_count": len(github_records), "matched_log_file_count": len(matched_logs), "top_risk_keywords": sorted(risk_keywords.items(), key=lambda item: (-item[1], item[0]))[:10], "detected_tool_counts": sorted(tool_counts.items(), key=lambda item: (-item[1], item[0])), "severity_summary": dict(sorted(severity_summary.items(), key=lambda item: -SEVERITY_SCORES.get(item[0], 0))), "high_risk_files": high_risk_files[:10], "missing_context": [item for item in missing_context if item], "next_actions": next_actions}
+
+
+def build_report(config: ScanConfig, events: Iterable[dict[str, Any]] | None = None) -> dict[str, Any]:
+    window = local_window(config.start_date, config.end_date, config.timezone_offset_hours)
+    github_records, github_errors = collect_github_records(config, window, events=events)
+    log_records, log_errors = collect_local_logs(config, window)
+    scope = {"github_username": config.github_username, "workspace_path": str(config.workspace_path), "window_label": window.label, "start": window.start.isoformat(), "end_exclusive": window.end.isoformat(), "timezone_offset_hours": config.timezone_offset_hours, "repositories": list(config.repositories), "extensions": list(config.extensions), "log_tools": list(config.log_tools), "include_pr_details": config.include_pr_details, "include_ci": config.include_ci, "cache_enabled": bool(config.cache_dir and config.cache_ttl_seconds > 0), "max_files": config.max_files, "max_file_bytes": config.max_file_bytes}
+    report = {"scope": scope, "github_activity": github_records, "local_logs": log_records, "errors": github_errors + log_errors}
+    if config.include_review:
+        report["review"] = build_review(scope, github_records, log_records, report["errors"])
+    return report
+
+
+def github_record_to_line(record: dict[str, Any]) -> str:
+    text = f"- [{record.get('kind', 'activity')}] {record.get('repo', 'unknown')}: {record.get('summary', '')}"
+    if record.get("timestamp")
